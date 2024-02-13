@@ -23,7 +23,7 @@ from encrypter import Encryptor
 from ecrypted_paths import encrypted_field_paths
 import time
 from datetime import datetime
-#from data_dog import *
+from data_dog import *
 from threading import Thread
 from confluent_kafka import KafkaException
 from multiprocessing import Process, Pipe
@@ -32,9 +32,9 @@ from shared_queue import address, authkey
 from multiprocessing.managers import BaseManager
 
 
-#kafka_metrics_reporter = get_kafka_metrics_reporter()
+kafka_metrics_reporter = get_kafka_metrics_reporter()
 kafka_instance_id = uuid.uuid4().hex.upper()
-_loop = asyncio.get_event_loop()
+
 
 
 def parse(dsn) -> dict[str, str]:
@@ -56,9 +56,9 @@ def get_base_settings(auth: dict, settings) -> dict[str, Any]:
                     'sasl.mechanisms': 'PLAIN',
                     'sasl.username':auth["key"],
                     'sasl.password':auth["secret"],
-                    #'stats_cb': lambda metrics_json: kafka_metrics_reporter.report(
-                    #    kafka_instance_id, metrics_json
-                    #),
+                    'stats_cb': lambda metrics_json: kafka_metrics_reporter.report(
+                        kafka_instance_id, metrics_json
+                    ),
                     'statistics.interval.ms':'100',
                     'delivery.timeout.ms':'2000',
                     'request.timeout.ms':'2000'
@@ -184,7 +184,8 @@ class AsyncKafkaProducer(AbstractAsyncKafkaProducer):
         dlq_type: MessageQueueType = MessageQueueType.CONFLUENT_KAFKA,
         **settings,
     ):
-        
+        self._loop = asyncio.get_event_loop()
+        #self._loop.add_signal_handler(signal.SIGUSR1, handle_signal)
         self.encrypted_field_paths=encrypted_field_paths
         
         self.encryptor = Encryptor()   
@@ -220,14 +221,12 @@ class AsyncKafkaProducer(AbstractAsyncKafkaProducer):
             self.dlq_producer =  Producer(parse(dlq_auth))
         self.started = False
 
-    async def _poll_loop(self):
+    def _poll_loop(self):
         while  self.started:
-            self.producer.poll(0)
-            await asyncio.sleep(0.1)
-            print("inside poll loop")
+            self.producer.poll(0.1)
             #time.sleep(1)
-            #if self.dlq_topic:
-             #   self.dlq_producer.poll(1)
+            if self.dlq_topic:
+                self.dlq_producer.poll(0.1)
 
 
     async def start(self):
@@ -241,8 +240,8 @@ class AsyncKafkaProducer(AbstractAsyncKafkaProducer):
         await self.encryptor.create_metadata("openAI")
         self.started = True
         #self._loop = asyncio.get_event_loop()
-        self._poll_thread = await self._poll_loop()
-        #self._poll_thread.start()
+        self._poll_thread = Thread(target=self._poll_loop)
+        self._poll_thread.start()
 
     async def close(self):
         self.started = False
@@ -251,7 +250,7 @@ class AsyncKafkaProducer(AbstractAsyncKafkaProducer):
         if(self.dlq_producer is not None):
             self.dlq_producer.flush()
             
-        await self._poll_thread.join()
+        self._poll_thread.join()
 
         """self.producer.flush()
     
@@ -288,16 +287,16 @@ class AsyncKafkaProducer(AbstractAsyncKafkaProducer):
         encrypted_value = await self.encrypt_fields(obj=value,topic=topic, encrypted_field_paths=self.encrypted_field_paths,encryptor=self.encryptor) 
         value = self.serializer.encode_record_with_schema(topic, self.value_schema, encrypted_value)
 
-        result = _loop.create_future()
+        result = self._loop.create_future()
         print("producing")
         def ack(err, msg):
             if err:
                 print("error")
                 #self.dlq_producer.produce(topic, value, on_delivery=ack)
-                _loop.call_soon_threadsafe(result.set_exception, KafkaException(err))
+                self._loop.call_soon_threadsafe(result.set_exception, KafkaException(err))
             else:
                 print("success")
-                _loop.call_soon_threadsafe(result.set_result, msg)
+                self._loop.call_soon_threadsafe(result.set_result, msg)
         try:        
             self.producer.produce(topic, value, on_delivery=ack)
         except Exception as e:
@@ -361,13 +360,12 @@ def handle_signal(signum, frame):
         try:
                 print("ID of shared_queue in producer:", id(queue))
                 # Process the arguments from the queue
-                arguments = queue.get()
-                # Call your method with the arguments
-                #my_method(*arguments)
-                #producer.produce(*arguments)
-                print(arguments)
+                while not queue.empty():
+                    arguments = queue.get()
+                    print(arguments)
+                    
+                    result=asyncio.run( producer.produce(topic=arguments['topic'],  value=arguments['value']) )
                 
-                return _loop.call_soon_threadsafe(lambda: producer.produce(topic=arguments['topic'],  value=arguments['value']) )
                 #return await ( await producer.produce(topic, key, value))
                 #await producer.close()
          
@@ -426,6 +424,5 @@ if __name__ == '__main__':
                                                 client_id='rahul',
                                                 compression_type='zstd'
                                             )
-    print(os.getpid())
     asyncio.run(producer.start())
-   
+    print("PID is "+str(os.getpid()))
